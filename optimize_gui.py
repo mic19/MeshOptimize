@@ -18,6 +18,7 @@ import numpy as np
 from enum import Enum
 from math import radians
 from mathutils import Matrix, Vector
+from mathutils.bvhtree import BVHTree
 
 from bpy.props import (StringProperty,
                        IntProperty,
@@ -68,80 +69,67 @@ override = {
 }
 
 
-def get_length(geodesic):
-    mesh = geodesic.data
-    bm = bmesh.from_edit_mesh(mesh)
+def get_geodesic_points(point1, point2, steps=10):
+    step = (point2 - point1)/steps
+    return [point1 + i * step for i in range(steps + 1)]
+
+
+def clear_geodesics(start_index, end_index):
+    bpy.ops.object.editmode_toggle()
+    bpy.ops.object.select_all(action='DESELECT')
+    
+    for i in range(start_index, end_index):
+        print('geodesic' + str(i))
+        bpy.data.objects['geodesic' + str(i)].select_set(True)
+        bpy.ops.object.delete()
+    get_geodesic_distance.counter = 0
+    
+    bpy.ops.object.editmode_toggle()
+
+    bpy.data.objects[VertTensor.obj.name].select_set(True)
+    bpy.context.view_layer.objects.active = bpy.data.objects[VertTensor.obj.name]
+    # After changing edit mode bm data is lost
+    mesh = VertTensor.obj.data
+    VertTensor.target_bm = bmesh.from_edit_mesh(mesh)
+
+
+def get_geodesic_distance(point1, point2):
+    get_geodesic_distance.counter += 1
+    steps = 10
+    vertices = get_geodesic_points(point1, point2, steps)
+    edges = [(i, i + 1) for i in range(steps)]
+    faces = []
+    
+    name = 'geodesic' + str(get_geodesic_distance.counter)
+    new_mesh = bpy.data.meshes.new(name)
+    new_mesh.from_pydata(vertices, edges, faces)
+    new_mesh.update()
+    geodesic = bpy.data.objects.new(name, new_mesh)
+    bpy.context.collection.objects.link(geodesic)
+
+    bv = BVHTree.FromBMesh(VertTensor.target_bm)
+    bm = bmesh.new()
+    bm.from_mesh(new_mesh)
+    bm.verts.ensure_lookup_table()
+    matrix_world = geodesic.matrix_world
+
+    for vert in bm.verts:
+        origin = matrix_world @ vert.co
+        location, normal, index, distance = bv.find_nearest(origin)
+        vert.co = location
+
+    bm.to_mesh(new_mesh)
     length = 0
     for edge in bm.edges:
         length += edge.calc_length()
-    return length
+    bm.free()
 
-
-def get_geodesic_distance(vert1, vert2, matrix_world):
-    """ Returns shortest geodesic distance between vert1 and vert2
-        on obj mesh. It is based on shrinkwrap modifier applied to
-        sequnce of edges so it is approximate and may no work for
-        some cases """
-    vertices = [matrix_world @ vert1, matrix_world @ vert2]
-    edges = [(0, 1)]
-    faces = []
-    
-    new_mesh = bpy.data.meshes.new('test')
-    new_mesh.from_pydata(vertices, edges, faces)
-    new_mesh.update()
-    geodesic = bpy.data.objects.new('geodesic', new_mesh)
-    bpy.context.collection.objects.link(geodesic)
-    
-    bpy.ops.object.editmode_toggle()
-    bpy.ops.object.select_all(action='DESELECT')
-    bpy.data.objects[geodesic.name].select_set(True)
-    bpy.context.view_layer.objects.active = bpy.data.objects[geodesic.name]
-    
-    bpy.ops.object.modifier_add(type='SHRINKWRAP')
-    bpy.context.object.modifiers["Shrinkwrap"].target = VertTensor.obj
-    bpy.context.object.modifiers["Shrinkwrap"].wrap_method = 'PROJECT'
-    bpy.context.object.modifiers["Shrinkwrap"].use_negative_direction = True
-    
-    bpy.ops.object.mode_set(mode = 'EDIT')
-    bpy.ops.mesh.loopcut_slide(
-        override, 
-        MESH_OT_loopcut = {
-            "number_cuts":10, 
-            "smoothness":0, 
-            "falloff":'INVERSE_SQUARE', 
-            "object_index":0, 
-            "edge_index":0, 
-            "mesh_select_mode_init":(True, False, False)
-        }, 
-        TRANSFORM_OT_edge_slide = {
-            "value":0, 
-            "single_side":False, 
-            "use_even":False, 
-            "flipped":False, 
-            "use_clamp":True, 
-            "mirror":False, 
-            "snap":False, 
-            "snap_target":'CLOSEST', 
-            "snap_point":(0, 0, 0), 
-            "snap_align":False, 
-            "snap_normal":(0, 0, 0), 
-            "correct_uv":True, 
-            "release_confirm":False, 
-            "use_accurate":False}
-        )
-    bpy.ops.object.editmode_toggle()
-    bpy.ops.object.modifier_apply(modifier="Shrinkwrap")
-    bpy.ops.object.editmode_toggle()
-
-    length = get_length(geodesic)
-    bpy.ops.object.editmode_toggle()
-    bpy.ops.object.delete()
-    
-    bpy.data.objects[VertTensor.obj.name].select_set(True)
-    bpy.context.view_layer.objects.active = bpy.data.objects[VertTensor.obj.name]
-    bpy.ops.object.editmode_toggle()
+    if get_geodesic_distance.counter % 500 == 0:
+        print("Removing temp objects")
+        clear_geodesics(get_geodesic_distance.counter - 499, get_geodesic_distance.counter + 1)
     
     return length
+get_geodesic_distance.counter = 0
 
 
 def get_close(vert, depth=3):
@@ -209,6 +197,7 @@ class FaceTensor:
 class VertTensor:
     obj = None
     matrix_world = None
+    target_bm = None
     def __init__(self, index, co, normal):
         self.index = index
         self.co = co
@@ -224,7 +213,7 @@ class VertTensor:
     def select_close_faces(self, proximity):
         self.selected_close_faces = []
         for tensor_face in self.close_faces:
-            length = get_geodesic_distance(self.co, tensor_face.center, VertTensor.matrix_world)
+            length = get_geodesic_distance(self.co, tensor_face.center)
             if length < proximity:
                 self.selected_close_faces.append(tensor_face)
 
@@ -248,16 +237,16 @@ class VertTensor:
         
         if max_val > corner_ratio * others[0] and max_val > corner_ratio * others[1]:
             self.classification = VertClass.SURFACE
-            print("surface")
+            #print("surface")
             return VertClass.SURFACE
         
         if get_num_similar(eigvals, contour_ratio, corner_ratio) is 2:
             self.classification = VertClass.CONTOUR
-            print("contour")
+            #print("contour")
             return VertClass.CONTOUR
         
         self.classification = VertClass.CORNER
-        print("corner")
+        #print("corner")
         return VertClass.CORNER
     
     
@@ -268,6 +257,7 @@ def select_contours_main(adjacency_depth, proximity):
     
     VertTensor.obj = obj
     VertTensor.matrix_world = obj.matrix_world
+    VertTensor.target_bm = bm
     index_to_vert_tensor = {v.index : VertTensor(v.index, v.co.copy(), v.normal.copy()) for v in bm.verts}
     iter = 0
 
@@ -283,6 +273,8 @@ def select_contours_main(adjacency_depth, proximity):
         index_to_vert_tensor[index].select_close_faces(proximity)
         index_to_vert_tensor[index].calculate_tensor()
         index_to_vert_tensor[index].classify()
+    
+    clear_geodesics(1, get_geodesic_distance.counter + 1)
 
     obj = bpy.context.edit_object
     mesh = obj.data
