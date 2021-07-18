@@ -14,6 +14,7 @@ bl_info = {
 
 import bpy, math, mathutils, copy, bmesh, time
 import numpy as np
+import pyopencl as cl
 
 from enum import Enum
 from math import radians
@@ -167,7 +168,7 @@ class VertTensor:
         self.co = co
         self.normal = normal
         self.close_faces = None
-        self.selected_close_faces = None
+        self.selected_close_faces = []
         self.tensor = None
         self.classification = None
 
@@ -176,10 +177,16 @@ class VertTensor:
    
     def select_close_faces(self, proximity):
         self.selected_close_faces = []
+        
         for tensor_face in self.close_faces:
             length = get_geodesic_distance(self.co, tensor_face.center)
             if length < proximity:
                 self.selected_close_faces.append(tensor_face)
+
+    def get_points_to_measure(self):
+        froms = [[self.co[0], self.co[1], self.co[2]] for i in range(len(self.close_faces))]
+        tos = [[tf.center[0], tf.center[1], tf.center[2]] for tf in self.close_faces]
+        return froms, tos
 
     def calculate_tensor(self):
         tensor = np.zeros((3, 3))
@@ -231,19 +238,388 @@ def select_contours_main(adjacency_depth, proximity):
         close_bm_verts = [v for v in get_close(bmvert, adjacency_depth)]
         close_faces = [FaceTensor(f.index, f.calc_center_median(), f.normal.copy()) for f in get_close_faces(close_bm_verts)]
         index_to_vert_tensor[index].set_close_faces(close_faces)
-        
+    
     select_time = 0
     calculate_time = 0
     classify_time = 0
-        
-    # select points from selected faces and calculate tensors
+    
+    length = 0
+    vert_froms_arrays = []
+    vert_tos_arrays = []
+    next_indexes = []
+    
+    # Get point from which and to which measure distance
     for index in index_to_vert_tensor:
-        start = time.time()
-        index_to_vert_tensor[index].select_close_faces(proximity)
-        end = time.time()
-        select_time += end - start
-        #print("select close face: " + str(end - start))
+        vert_froms, vert_tos = index_to_vert_tensor[index].get_points_to_measure()
         
+        vert_froms_arrays.append([])
+        vert_tos_arrays.append([])
+        for i in range(len(vert_froms)):
+            vert_froms_arrays[index].append(vert_froms[i])
+            vert_tos_arrays[index].append(vert_tos[i])
+        
+        next_indexes.append(length)
+        length += len(vert_tos)
+    
+    next_indexes.append(length)
+    froms = np.zeros(shape=(length, 3), dtype=np.float32)
+    tos = np.zeros(shape=(length, 3), dtype=np.float32)
+    
+    # Copy these points to numpy array to be able to use in opencl
+    array_iter = 0
+    for index in index_to_vert_tensor:
+        for i in range(len(vert_froms_arrays[index])):
+            froms[array_iter + i] = vert_froms_arrays[index][i]
+            tos[array_iter + i] = vert_tos_arrays[index][i]
+        
+        array_iter += len(vert_froms_arrays[index])
+    
+    print('- From points -')
+    print(froms)
+    print('- To points -')
+    print(tos)
+    
+    # PREPARING INPUT
+    faces_points1_world = [VertTensor.matrix_world @ face.verts[0].co for face in VertTensor.target_bm.faces]
+    faces_points2_world = [VertTensor.matrix_world @ face.verts[1].co for face in VertTensor.target_bm.faces]
+    faces_points3_world = [VertTensor.matrix_world @ face.verts[2].co for face in VertTensor.target_bm.faces]
+    
+    points1 = np.array([[p[0], p[1], p[2]] for p in faces_points1_world], dtype=np.float32)
+    points2 = np.array([[p[0], p[1], p[2]] for p in faces_points2_world], dtype=np.float32)
+    points3 = np.array([[p[0], p[1], p[2]] for p in faces_points3_world], dtype=np.float32)
+    
+    normals = np.array([[face.normal.x, face.normal.y, face.normal.z] for face in VertTensor.target_bm.faces], dtype=np.float32)
+    length = np.array([len(VertTensor.target_bm.faces)], dtype=np.int32)
+    
+    output_distances = np.zeros(shape=(len(froms)), dtype=np.float32)
+    
+    # OPENCL
+    cntxt = cl.create_some_context()
+    queue = cl.CommandQueue(cntxt)
+
+    points1_buf = cl.Buffer(cntxt, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=points1)
+    points2_buf = cl.Buffer(cntxt, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=points2)
+    points3_buf = cl.Buffer(cntxt, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=points3)
+    
+    froms_buf = cl.Buffer(cntxt, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=froms)
+    tos_buf = cl.Buffer(cntxt, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=tos)
+    
+    normals_buf = cl.Buffer(cntxt, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,hostbuf=normals)
+    length_buf = cl.Buffer(cntxt, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,hostbuf=length)
+
+    output_distances_buf = cl.Buffer(cntxt, cl.mem_flags.READ_ONLY, output_distances.nbytes)
+
+    # Kernel Program
+    code = """
+    float dot_operator(float* vec1, float* vec2)
+    {
+        float output = 0;
+        for (int i = 0; i < 3; ++i)
+            output += vec1[i] * vec2[i];
+        return output;
+    }
+    
+    float* cross_operator(float* vec1, float* vec2, float* output)
+    {
+        output[0] = vec1[1] * vec2[2] - vec1[2] * vec2[1];
+        output[1] = vec1[2] * vec2[0] - vec1[0] * vec2[2];
+        output[2] = vec1[0] * vec2[1] - vec1[1] * vec2[0];
+        return output;
+    }
+    
+    float get_length(float* vec)
+    {
+        return sqrt(vec[0] * vec[0] + vec[1] * vec[1] + vec[2] * vec[2]);
+    }
+    
+    float* substract(float* vec1, float* vec2, float* output)
+    {
+        for (int i = 0; i < 3; ++i)
+            output[i] = vec1[i] - vec2[i];
+        return output;
+    }
+    
+    float* add(float* vec1, float* vec2, float* output)
+    {
+        for (int i = 0; i < 3; ++i)
+            output[i] = vec1[i] + vec2[i];
+        return output;
+    }
+    
+    float* multiply(float* vec, float val, float* output)
+    {
+        for (int i = 0; i < 3; ++i)
+            output[i] = vec[i] * val;
+        return output;
+    }
+    
+    void copy(float* from, float* to)
+    {
+        for (int i = 0; i < 3; ++i)
+            to[i] = from[i];
+    }
+    
+    void get_barycentric(float* a, float* b, float* c, float* p, float* coors)
+    {
+        float v0[3], v1[3], v2[3];
+        substract(b, a, v0);
+        substract(c, a, v1);
+        substract(p, a, v2);
+        
+        float d00 = dot_operator(v0, v0);
+        float d01 = dot_operator(v0, v1);
+        float d11 = dot_operator(v1, v1);
+        float d20 = dot_operator(v2, v0);
+        float d21 = dot_operator(v2, v1);
+        float denom = d00 * d11 - d01 * d01;
+        
+        coors[0] = (d11 * d20 - d01 * d21) / denom; //v
+        coors[1] = (d00 * d21 - d01 * d20) / denom; //w
+        coors[2] = 1.0 - coors[0] - coors[1]; //u
+    }
+    
+    bool is_inside(float* point1, float* point2, float* point3, float* p)
+    {
+        float coors[3];
+        get_barycentric(point1, point2, point3, p, coors);
+        
+        for (int i = 0; i < 3; ++i)
+        {
+            if (coors[i] < 0 || coors[i] > 1)
+                return false;
+        }
+        
+        return true;
+    }
+    
+    bool is_point_projection_on_line_segment(float coor1, float coor2, float projection_coor)
+    {
+        float delta = 0.02;
+        bool flag = false;
+        if (coor1 < coor2)
+            flag = (coor1 < (projection_coor + delta) && (projection_coor - delta) < coor2);
+        else
+            flag = (coor2 < (projection_coor + delta) && (projection_coor - delta) < coor1);
+        return flag;
+    }
+    
+    bool is_point_projection_on_line(float* point1, float* point2, float* p, float* output_projection)
+    {
+        float ap[3], ab[3];
+        substract(p, point1, ap);
+        substract(point2, point1, ab);
+        float mul = dot_operator(ap, ab) / dot_operator(ab, ab);
+        float projection[3];
+        float temp[3] = {mul * ab[0], mul * ab[1], mul * ab[2]};
+        add(point1, temp, projection);
+        bool flag_x = false, flag_y = false, flag_z = false;
+        
+        copy(projection, output_projection);
+        
+        flag_x = is_point_projection_on_line_segment(point1[0], point2[0], projection[0]);
+        flag_y = is_point_projection_on_line_segment(point1[1], point2[1], projection[1]);
+        flag_z = is_point_projection_on_line_segment(point1[2], point2[2], projection[2]);
+        
+        return flag_x && flag_y && flag_z;
+    }
+    
+    float get_distance_from_line(float* point1, float* point2, float* p, float* output_point)
+    {
+        float min_distance = 10000;
+        float step[3], d[3], temp[3];
+        
+        substract(point2, point1, step);
+        substract(point1, p, d);
+        float output_projection[3];
+        
+        if (is_point_projection_on_line(point1, point2, p, output_projection))
+        {
+            float distance = fabs(get_length(cross_operator(step, d, temp)))/(fabs(get_length(step)));
+            if (distance < min_distance)
+            {
+                min_distance = distance;
+                copy(output_projection, output_point);
+            }
+        } else
+        {
+            float temp[3];
+            substract(point1, p, temp);
+            float distance1 = get_length(temp);
+            substract(point2, p, temp);
+            float distance2 = get_length(temp);
+            
+            if (distance1 < min_distance)
+            {
+                min_distance = distance1;
+                copy(point1, output_point);
+            }
+                
+            if (distance2 < min_distance)
+            {
+                min_distance = distance2;
+                copy(point2, output_point);
+            }
+        }
+        
+        return min_distance;
+    }
+    
+    float get_min_distance_outside(float* point1, float* point2, float* point3, float* p, float* output_point)
+    {
+        float min_distance = 10000;
+        float temp1[3], temp2[3], temp3[3];
+        float distance1 = get_distance_from_line(point1, point2, p, temp1);
+        float distance2 = get_distance_from_line(point2, point3, p, temp2);
+        float distance3 = get_distance_from_line(point1, point3, p, temp3);
+        
+        if (distance1 < min_distance)
+        {
+            min_distance = distance1;
+            copy(temp1, output_point);
+        }
+        if (distance2 < min_distance)
+        {
+            min_distance = distance2;
+            copy(temp2, output_point);
+        }
+        if (distance3 < min_distance)
+        {
+            min_distance = distance3;
+            copy(temp3, output_point);
+        }
+        
+        return min_distance;
+    }
+    
+    void get_point_on_mesh(float* points1, float* points2, float* points3,
+                               float* normals, int length, float* p,
+                               float* output_point
+                               )
+    {
+        float min_distance = INFINITY;
+        
+        for (int i = 0; i < length; ++i)
+        {
+            int iter = 3 * i;
+            float point1[3] = {points1[iter], points1[iter + 1], points1[iter + 2]};
+            float point2[3] = {points2[iter], points2[iter + 1], points2[iter + 2]};
+            float point3[3] = {points3[iter], points3[iter + 1], points3[iter + 2]};
+            
+            bool is_inside_flag = is_inside(point1, point2, point3, p);
+            if (is_inside_flag)
+            {
+                float A = normals[iter], B = normals[iter + 1], C = normals[iter + 2];
+                float D = -A * points1[iter] - B * points1[iter + 1] - C * points1[iter + 2];
+                float distance = (A * p[0] + B * p[1] + C * p[2] + D)/sqrt(A * A + B * B + C * C);
+                if (fabs(distance) < min_distance)
+                {
+                    min_distance = fabs(distance);
+                    output_point[0] = p[0] - distance * normals[iter];
+                    output_point[1] = p[1] - distance * normals[iter + 1];
+                    output_point[2] = p[2] - distance * normals[iter + 2];
+                }
+            }else
+            {
+                float temp[3];
+                float distance = get_min_distance_outside(point1, point2, point3, p, temp);
+                if (distance < min_distance)
+                {
+                    min_distance = distance;
+                    output_point[0] = temp[0];
+                    output_point[1] = temp[1];
+                    output_point[2] = temp[2];
+                }
+            }
+        }
+        
+        
+    }
+    
+    void get_middle_points(float* from, float* to, float* output_middle_points, int length)
+    {
+        float difference[3], step[3];
+        substract(to, from, difference);
+        multiply(difference, 1/(float)(length - 1), step);
+        
+        //printf("|%f, %f, %f|", step[0], step[1], step[2]);
+        
+        for (int i = 0; i < length; ++i)
+        {
+            float middle_point[3], temp[3];
+            add(from, multiply(step, i, temp), middle_point);
+            copy(middle_point, output_middle_points + 3 * i);
+        }
+    }
+    
+    #define STEP_IN_GEODESIC 10
+    
+    __kernel void get_geodesic_distances(__global float* points1, __global float* points2, __global float* points3,
+                                        __global float* normals, __global int* length,
+                                        __global float* froms, __global float* tos, __global float* output_distances)
+    {
+        int gid = get_global_id(0);
+        
+        //printf("|%d", gid);
+        
+        float middle_points[3 * STEP_IN_GEODESIC], points_projections[3 * STEP_IN_GEODESIC];
+        get_middle_points(froms + gid * 3, tos + gid * 3, middle_points, STEP_IN_GEODESIC);
+        
+        for (int i = 0; i < STEP_IN_GEODESIC; i+=3)
+        {
+            get_point_on_mesh(points1, points2, points3, normals, length[0], middle_points + i, points_projections + i);
+        }
+        
+        float distance = 0;
+        for (int i = 0; i < STEP_IN_GEODESIC - 3; i+=3)
+        {
+            float temp[3];
+            substract(points_projections + i + 3, points_projections + i, temp);
+            distance += get_length(temp);
+        }
+        
+        output_distances[gid] = distance;
+        //printf("|%f|", distance);
+    }
+    """
+    
+    start = time.perf_counter()
+
+    bld = cl.Program(cntxt, code).build()
+    launch = bld.get_geodesic_distances(queue, [len(froms)], None,
+                                   points1_buf, points2_buf, points3_buf,
+                                   normals_buf, length_buf,
+                                   froms_buf, tos_buf,
+                                   output_distances_buf)
+
+    launch.wait()
+
+    cl.enqueue_copy(queue, output_distances, output_distances_buf)
+    
+    end = time.perf_counter()
+
+    print("Elepsed time OpenCl: " + str(end - start))
+    print(len(output_distances))
+    print(output_distances)
+    
+    close_counter = 0
+    not_close_counter = 0
+    
+    tensor_index = 0
+    for i in range(len(next_indexes) - 1):
+        index = next_indexes[i]
+        next_index = next_indexes[i + 1]
+        for j in range(index, next_index):
+            if(output_distances[j] < proximity):
+                index_to_vert_tensor[tensor_index].selected_close_faces.append(index_to_vert_tensor[tensor_index].close_faces[j - index])
+                close_counter += 1
+            else:
+                not_close_counter += 1
+        tensor_index += 1
+    
+    print("close: " + str(close_counter))
+    print("not close: " + str(not_close_counter))
+    
+    for index in index_to_vert_tensor:
         start = time.time()
         index_to_vert_tensor[index].calculate_tensor()
         end = time.time()
@@ -481,7 +857,6 @@ class View3DPanel:
 
     @classmethod
     def poll(cls, context):
-        # TODO: checking context like context.object is not None
         return True
 
 
@@ -585,3 +960,4 @@ if __name__ == "__main__":
             
             
             
+
