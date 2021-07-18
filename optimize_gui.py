@@ -12,7 +12,7 @@ bl_info = {
 }
 
 
-import bpy, math, mathutils, copy, bmesh
+import bpy, math, mathutils, copy, bmesh, time
 import numpy as np
 
 from enum import Enum
@@ -74,62 +74,26 @@ def get_geodesic_points(point1, point2, steps=10):
     return [point1 + i * step for i in range(steps + 1)]
 
 
-def clear_geodesics(start_index, end_index):
-    bpy.ops.object.editmode_toggle()
-    bpy.ops.object.select_all(action='DESELECT')
-    
-    for i in range(start_index, end_index):
-        print('geodesic' + str(i))
-        bpy.data.objects['geodesic' + str(i)].select_set(True)
-        bpy.ops.object.delete()
-    get_geodesic_distance.counter = 0
-    
-    bpy.ops.object.editmode_toggle()
-
-    bpy.data.objects[VertTensor.obj.name].select_set(True)
-    bpy.context.view_layer.objects.active = bpy.data.objects[VertTensor.obj.name]
-    # After changing edit mode bm data is lost
-    mesh = VertTensor.obj.data
-    VertTensor.target_bm = bmesh.from_edit_mesh(mesh)
+def get_distance(point1, point2):
+    vec = point2 - point1
+    return math.sqrt(vec[0] ** 2 + vec[1] ** 2 + vec[2] ** 2)
 
 
 def get_geodesic_distance(point1, point2):
-    get_geodesic_distance.counter += 1
     steps = 10
-    vertices = get_geodesic_points(point1, point2, steps)
-    edges = [(i, i + 1) for i in range(steps)]
-    faces = []
-    
-    name = 'geodesic' + str(get_geodesic_distance.counter)
-    new_mesh = bpy.data.meshes.new(name)
-    new_mesh.from_pydata(vertices, edges, faces)
-    new_mesh.update()
-    geodesic = bpy.data.objects.new(name, new_mesh)
-    bpy.context.collection.objects.link(geodesic)
-
+    points = get_geodesic_points(point1, point2, steps)
     bv = BVHTree.FromBMesh(VertTensor.target_bm)
-    bm = bmesh.new()
-    bm.from_mesh(new_mesh)
-    bm.verts.ensure_lookup_table()
-    matrix_world = geodesic.matrix_world
 
-    for vert in bm.verts:
-        origin = matrix_world @ vert.co
+    for i in range(len(points)):
+        origin = points[i]
         location, normal, index, distance = bv.find_nearest(origin)
-        vert.co = location
+        points[i] = location
 
-    bm.to_mesh(new_mesh)
     length = 0
-    for edge in bm.edges:
-        length += edge.calc_length()
-    bm.free()
+    for i in range(len(points) - 1):
+        length += get_distance(points[i], points[i + 1])
 
-    if get_geodesic_distance.counter % 500 == 0:
-        print("Removing temp objects")
-        clear_geodesics(get_geodesic_distance.counter - 499, get_geodesic_distance.counter + 1)
-    
     return length
-get_geodesic_distance.counter = 0
 
 
 def get_close(vert, depth=3):
@@ -268,13 +232,33 @@ def select_contours_main(adjacency_depth, proximity):
         close_faces = [FaceTensor(f.index, f.calc_center_median(), f.normal.copy()) for f in get_close_faces(close_bm_verts)]
         index_to_vert_tensor[index].set_close_faces(close_faces)
         
+    select_time = 0
+    calculate_time = 0
+    classify_time = 0
+        
     # select points from selected faces and calculate tensors
     for index in index_to_vert_tensor:
+        start = time.time()
         index_to_vert_tensor[index].select_close_faces(proximity)
+        end = time.time()
+        select_time += end - start
+        #print("select close face: " + str(end - start))
+        
+        start = time.time()
         index_to_vert_tensor[index].calculate_tensor()
+        end = time.time()
+        calculate_time = end - start
+        #print("calculate tensor: " + str(end - start))
+        
+        start = time.time()
         index_to_vert_tensor[index].classify()
+        end = time.time()
+        classify_time += end - start
+        #print("classify: " + str(end - start))
     
-    clear_geodesics(1, get_geodesic_distance.counter + 1)
+    print("select close face: " + str(select_time))
+    print("calculate tensor: " + str(calculate_time))
+    print("classify: " + str(classify_time))
 
     obj = bpy.context.edit_object
     mesh = obj.data
