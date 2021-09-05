@@ -3,7 +3,7 @@
 This Addon helps detecting features on mesh and removing them. Detecting features was based on article 'Feature Detection for Surface Meshes' by Xiangmin Jiao and Michael T. Heath. 
 
 
-<img src="/example_animation.gif" border="0" />
+<img src="/example.gif" border="0" />
 
 ## Getting Started
 This Addon uses operators from Addon 3D-Print Toolbox so it should be installed first. 
