@@ -433,11 +433,6 @@ def select_contours_main(adjacency_depth, proximity):
                 selected += 1
         if selected == len(connected):
             vert.select = True
-    
-#    all_end = time.time()
-#    print('all time: ' + str(all_end - all_start))
-    print('selecting time: ' + str(time.time() - starting))
-    starting = time.time()
 
 
 # Divide Surfaces #################################################################################################################
@@ -495,9 +490,7 @@ def divide_surfaces_main():
     while len(selected_verts) > 0:
         current_vert = selected_verts[0]
         cluster = get_cluster(selected_verts, current_vert)
-        clusters.append([])
-        clusters[current_cluster].extend(cluster)
-        current_cluster += 1
+        clusters.append(cluster)
         remove_verts(selected_verts, cluster)
     
     # Prepare indexes of vertices to add vertex groups
@@ -560,24 +553,53 @@ def select_element(index):
     bpy.ops.object.mode_set(mode="EDIT")
 
 
-def optimize_select_prev_main():
-    print('select prev')
-    bpy.context.active_object.iter -= 1
-    if bpy.context.active_object.iter < 1:
-        bpy.context.active_object.iter = bpy.context.active_object.num_elements
+def find_prev(iter):
+    obj = bpy.context.edit_object
+    max = 0
+    prev = None
     
-    print('iter: ' + str(bpy.context.active_object.iter))
+    for vertex_group in reversed(obj.vertex_groups):
+        print(vertex_group.name)
+        if 'Element' in vertex_group.name:
+            index = int(vertex_group.name.split('Element')[1])
+            if iter > index and prev is None:
+                prev = index
+            if index > max:
+                max = index
+    
+    if prev is not None:
+        return prev
+    else:
+        return max
+
+
+def optimize_select_prev_main():
+    bpy.context.active_object.iter = find_prev(bpy.context.active_object.iter)
     select_element(bpy.context.active_object.iter)
 
 
-def optimize_select_next_main():
-    print('select next')
-    bpy.context.active_object.iter += 1
-    if bpy.context.active_object.iter > bpy.context.active_object.num_elements:
-        bpy.context.active_object.iter = 1
+def find_next(iter):
+    obj = bpy.context.edit_object
+    min = 10000
+    next = None
+    
+    for vertex_group in obj.vertex_groups:
+        print(vertex_group.name)
+        if 'Element' in vertex_group.name:
+            index = int(vertex_group.name.split('Element')[1])
+            if iter < index and next is None:
+                next = index
+            if index < min:
+                min = index
+    
+    if next is not None:
+        return next
+    else:
+        return min
 
-    print('iter: ' + str(bpy.context.active_object.iter))
-    print('num_elements: ' + str(bpy.context.active_object.num_elements))
+
+def optimize_select_next_main():
+    bpy.context.active_object.iter = find_next(bpy.context.active_object.iter)
     select_element(bpy.context.active_object.iter)
 
 
@@ -593,6 +615,14 @@ def optimize_focus_main():
             # bpy.ops.view3d.camera_to_view_selected(ctx) # points camera
 
 
+def optimize_is_there_group(name):
+    obj = bpy.context.edit_object
+    for vertex_group in obj.vertex_groups:
+        if vertex_group.name == name:
+            return True
+    return False
+
+
 def optimize_surfaces_main():
     expand_selection()
     bpy.ops.mesh.delete(type='VERT')
@@ -602,6 +632,11 @@ def optimize_surfaces_main():
     
     bpy.ops.mesh.print3d_clean_non_manifold()
     bpy.ops.mesh.select_all(action='DESELECT')
+    
+    obj = bpy.context.edit_object
+    index = bpy.context.active_object.iter
+    group_name = 'Element' + str(index)
+    obj.vertex_groups.remove(obj.vertex_groups[group_name])
     
 #    bpy.ops.object.modifier_add(type='DECIMATE')
 #    bpy.context.object.modifiers['Decimate'].decimate_type = 'COLLAPSE'
@@ -626,14 +661,14 @@ class OperatorSelectContoursProperties(bpy.types.PropertyGroup):
     CornerThreshold: FloatProperty(
         name="Corner Threshold",
         description="Corner threshold of the algorithm",
-        default=0.35,
+        default=0.15,
         min=0,
         max=1
     )
     ContourThreshold: FloatProperty(
         name="Contour Threshold",
         description="Contour threshold depth of the algorithm",
-        default=0.2,
+        default=0.1,
         min=0,
         max=1
     )
